@@ -1882,6 +1882,25 @@ func (o *consumer) checkPendingRequests() {
 	o.prm = nil
 }
 
+// This will release any pending pull requests if applicable.
+// Should be called only by the leader being deleted or stopped.
+// Lock should be held.
+func (o *consumer) releaseAnyPendingRequests() {
+	if o.mset == nil || o.outq == nil || o.waiting.len() == 0 {
+		return
+	}
+	hdr := []byte("NATS/1.0 409 Consumer Deleted\r\n\r\n")
+	wq := o.waiting
+	o.waiting = nil
+	for i, rp := 0, wq.rp; i < wq.n; i++ {
+		if wr := wq.reqs[rp]; wr != nil {
+			o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+			wr.recycle()
+		}
+		rp = (rp + 1) % cap(wq.reqs)
+	}
+}
+
 // Process a NAK.
 func (o *consumer) processNak(sseq, dseq, dc uint64, nak []byte) {
 	o.mu.Lock()
@@ -2618,7 +2637,7 @@ func (o *consumer) pendingRequests() map[string]*waitingRequest {
 		return nil
 	}
 	wq, m := o.waiting, make(map[string]*waitingRequest)
-	for i, rp := 0, o.waiting.rp; i < wq.n; i++ {
+	for i, rp := 0, wq.rp; i < wq.n; i++ {
 		if wr := wq.reqs[rp]; wr != nil {
 			m[wr.reply] = wr
 		}
@@ -2649,7 +2668,8 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 			} else {
 				// Since we can't send that message to the requestor, we need to
 				// notify that we are closing the request.
-				hdr := []byte(fmt.Sprintf("NATS/1.0 409 Message Size Exceeds MaxBytes\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b))
+				const maxBytesT = "NATS/1.0 409 Message Size Exceeds MaxBytes\r\n%s: %d\r\n%s: %d\r\n\r\n"
+				hdr := []byte(fmt.Sprintf(maxBytesT, JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b))
 				o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 				// Remove the current one, no longer valid due to max bytes limit.
 				o.waiting.removeCurrent()
@@ -2672,7 +2692,8 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 			}
 		}
 		if wr.interest != wr.reply {
-			hdr := []byte(fmt.Sprintf("NATS/1.0 408 Interest Expired\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b))
+			const intExpT = "NATS/1.0 408 Interest Expired\r\n%s: %d\r\n%s: %d\r\n\r\n"
+			hdr := []byte(fmt.Sprintf(intExpT, JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b))
 			o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 		}
 		// Remove the current one, no longer valid.
@@ -4014,6 +4035,10 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 		if advisory {
 			o.sendDeleteAdvisoryLocked()
 		}
+		if o.isPullMode() {
+			// Release any pending.
+			o.releaseAnyPendingRequests()
+		}
 	}
 
 	if o.qch != nil {
@@ -4080,13 +4105,18 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 	// We will do this consistently on all replicas. Note that if in clustered mode the
 	// non-leader consumers will need to restore state first.
 	if dflag && rp == InterestPolicy {
-		stop := mset.lastSeq()
+		state := mset.state()
+		stop := state.LastSeq
 		o.mu.Lock()
 		if !o.isLeader() {
 			o.readStoredState(stop)
 		}
 		start := o.asflr
 		o.mu.Unlock()
+		// Make sure we start at worst with first sequence in the stream.
+		if start < state.FirstSeq {
+			start = state.FirstSeq
+		}
 
 		var rmseqs []uint64
 		mset.mu.RLock()

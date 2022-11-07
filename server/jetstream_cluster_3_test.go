@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"reflect"
 	"strings"
@@ -1002,4 +1003,281 @@ func TestJetStreamClusterStreamLagWarning(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		// OK
 	}
+}
+
+// https://github.com/nats-io/nats-server/issues/3603
+func TestJetStreamClusterSignalPullConsumersOnDelete(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// Create 2 pull consumers.
+	sub1, err := js.PullSubscribe("foo", "d1")
+	require_NoError(t, err)
+
+	sub2, err := js.PullSubscribe("foo", "d2")
+	require_NoError(t, err)
+
+	// We want to make sure we get kicked out prior to the timeout
+	// when consumers are being deleted or the parent stream is being deleted.
+	// Note this should be lower case, Go client needs to be updated.
+	expectedErr := errors.New("nats: Consumer Deleted")
+
+	// Queue up the delete for sub1
+	time.AfterFunc(250*time.Millisecond, func() { js.DeleteConsumer("TEST", "d1") })
+	start := time.Now()
+	_, err = sub1.Fetch(1, nats.MaxWait(10*time.Second))
+	require_Error(t, err, expectedErr)
+
+	// Check that we bailed early.
+	if time.Since(start) > time.Second {
+		t.Fatalf("Took to long to bail out on consumer delete")
+	}
+
+	time.AfterFunc(250*time.Millisecond, func() { js.DeleteStream("TEST") })
+	start = time.Now()
+	_, err = sub2.Fetch(1, nats.MaxWait(10*time.Second))
+	require_Error(t, err, expectedErr)
+	if time.Since(start) > time.Second {
+		t.Fatalf("Took to long to bail out on stream delete")
+	}
+}
+
+// https://github.com/nats-io/nats-server/issues/3559
+func TestJetStreamClusterSourceWithOptStartTime(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	test := func(t *testing.T, c *cluster, s *Server) {
+
+		replicas := 1
+		if c != nil {
+			s = c.randomServer()
+			replicas = 3
+		}
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Replicas: replicas,
+		})
+		require_NoError(t, err)
+
+		yesterday := time.Now().Add(-24 * time.Hour)
+
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:     "SOURCE",
+			Replicas: replicas,
+			Sources: []*nats.StreamSource{&nats.StreamSource{
+				Name:         "TEST",
+				OptStartTime: &yesterday,
+			}},
+		})
+		require_NoError(t, err)
+
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:     "MIRROR",
+			Replicas: replicas,
+			Mirror: &nats.StreamSource{
+				Name:         "TEST",
+				OptStartTime: &yesterday,
+			},
+		})
+		require_NoError(t, err)
+
+		total := 10
+		for i := 0; i < total; i++ {
+			sendStreamMsg(t, nc, "foo", "hello")
+		}
+
+		checkCount := func(sname string, expected int) {
+			t.Helper()
+			checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+				si, err := js.StreamInfo(sname)
+				if err != nil {
+					return err
+				}
+				if n := si.State.Msgs; n != uint64(expected) {
+					return fmt.Errorf("Expected stream %q to have %v messages, got %v", sname, expected, n)
+				}
+				return nil
+			})
+		}
+
+		checkCount("TEST", 10)
+		checkCount("SOURCE", 10)
+		checkCount("MIRROR", 10)
+
+		err = js.PurgeStream("SOURCE")
+		require_NoError(t, err)
+		err = js.PurgeStream("MIRROR")
+		require_NoError(t, err)
+
+		checkCount("TEST", 10)
+		checkCount("SOURCE", 0)
+		checkCount("MIRROR", 0)
+
+		nc.Close()
+		if c != nil {
+			c.stopAll()
+			c.restartAll()
+
+			c.waitOnStreamLeader(globalAccountName, "TEST")
+			c.waitOnStreamLeader(globalAccountName, "SOURCE")
+			c.waitOnStreamLeader(globalAccountName, "MIRROR")
+
+			s = c.randomServer()
+		} else {
+			sd := s.JetStreamConfig().StoreDir
+			s.Shutdown()
+			s = RunJetStreamServerOnPort(-1, sd)
+		}
+
+		// Wait a bit before checking because sync'ing (even with the defect)
+		// would not happen right away. I tried with 1 sec and test would pass,
+		// so need to be at least that much.
+		time.Sleep(2 * time.Second)
+
+		nc, js = jsClientConnect(t, s)
+		defer nc.Close()
+		checkCount("TEST", 10)
+		checkCount("SOURCE", 0)
+		checkCount("MIRROR", 0)
+	}
+
+	t.Run("standalone", func(t *testing.T) { test(t, nil, s) })
+	t.Run("cluster", func(t *testing.T) { test(t, c, nil) })
+}
+
+type networkCableUnplugged struct {
+	net.Conn
+	sync.Mutex
+	unplugged bool
+	wb        bytes.Buffer
+	wg        sync.WaitGroup
+}
+
+func (c *networkCableUnplugged) Write(b []byte) (int, error) {
+	c.Lock()
+	if c.unplugged {
+		c.wb.Write(b)
+		c.Unlock()
+		return len(b), nil
+	} else if c.wb.Len() > 0 {
+		c.wb.Write(b)
+		buf := c.wb.Bytes()
+		c.wb.Reset()
+		c.Unlock()
+		if _, err := c.Conn.Write(buf); err != nil {
+			return 0, err
+		}
+		return len(b), nil
+	}
+	c.Unlock()
+	return c.Conn.Write(b)
+}
+
+func (c *networkCableUnplugged) Read(b []byte) (int, error) {
+	c.Lock()
+	wait := c.unplugged
+	c.Unlock()
+	if wait {
+		c.wg.Wait()
+	}
+	return c.Conn.Read(b)
+}
+
+func TestJetStreamClusterScaleDownWhileNoQuorum(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R5S", 5)
+	defer c.shutdown()
+
+	s := c.randomServer()
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	si, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 2,
+	})
+	require_NoError(t, err)
+
+	for i := 0; i < 1000; i++ {
+		sendStreamMsg(t, nc, "foo", "msg")
+	}
+
+	// Let's have a server from this R2 stream be network partitionned.
+	// We will take the leader, but doesn't have to be.
+	// To simulate partition, we will replace all its routes with a
+	// special connection that drops messages.
+	sl := c.serverByName(si.Cluster.Leader)
+	if s == sl {
+		nc.Close()
+		for s = c.randomServer(); s != sl; s = c.randomServer() {
+		}
+		nc, js = jsClientConnect(t, s)
+		defer nc.Close()
+	}
+
+	sl.mu.Lock()
+	for _, r := range sl.routes {
+		r.mu.Lock()
+		ncu := &networkCableUnplugged{Conn: r.nc, unplugged: true}
+		ncu.wg.Add(1)
+		r.nc = ncu
+		r.mu.Unlock()
+	}
+	sl.mu.Unlock()
+
+	// Wait for the stream info to fail
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		si, err := js.StreamInfo("TEST", nats.MaxWait(time.Second))
+		if err != nil {
+			return err
+		}
+		if si.Cluster.Leader == _EMPTY_ {
+			return nil
+		}
+		return fmt.Errorf("stream still has a leader")
+	})
+
+	// Now try to edit the stream by making it an R1. In some case we get
+	// a context deadline error, in some no error. So don't check the returned error.
+	js.UpdateStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 1,
+	}, nats.MaxWait(5*time.Second))
+
+	sl.mu.Lock()
+	for _, r := range sl.routes {
+		r.mu.Lock()
+		ncu := r.nc.(*networkCableUnplugged)
+		ncu.Lock()
+		ncu.unplugged = false
+		ncu.wg.Done()
+		ncu.Unlock()
+		r.mu.Unlock()
+	}
+	sl.mu.Unlock()
+
+	checkClusterFormed(t, c.servers...)
+	c.waitOnStreamLeader(globalAccountName, "TEST")
 }
