@@ -2632,7 +2632,6 @@ func TestMonitorClusterURLs(t *testing.T) {
 		}
 	`
 	conf := createConfFile(t, []byte(fmt.Sprintf(template, "nats://"+s2ClusterHostPort, "")))
-	defer removeFile(t, conf)
 	s1, _ := RunServerWithConfig(conf)
 	defer s1.Shutdown()
 
@@ -3249,7 +3248,6 @@ func TestMonitorGatewayzAccounts(t *testing.T) {
 		}
 		no_sys_acc = true
 	`, accounts)))
-	defer removeFile(t, bConf)
 
 	sb, ob := RunServerWithConfig(bConf)
 	defer sb.Shutdown()
@@ -3274,7 +3272,6 @@ func TestMonitorGatewayzAccounts(t *testing.T) {
 		}
 		no_sys_acc = true
 	`, accounts, sb.GatewayAddr().Port)))
-	defer removeFile(t, aConf)
 
 	sa, oa := RunServerWithConfig(aConf)
 	defer sa.Shutdown()
@@ -3651,7 +3648,6 @@ func TestMonitorOpJWT(t *testing.T) {
 	resolver = MEMORY
 	`
 	conf := createConfFile(t, []byte(content))
-	defer removeFile(t, conf)
 	sa, _ := RunServerWithConfig(conf)
 	defer sa.Shutdown()
 
@@ -3682,6 +3678,7 @@ func TestMonitorOpJWT(t *testing.T) {
 
 func TestMonitorLeafz(t *testing.T) {
 	content := `
+	server_name: "hub"
 	listen: "127.0.0.1:-1"
 	http: "127.0.0.1:-1"
 	operator = "../test/configs/nkeys/op.jwt"
@@ -3692,7 +3689,6 @@ func TestMonitorLeafz(t *testing.T) {
 	}
 	`
 	conf := createConfFile(t, []byte(content))
-	defer removeFile(t, conf)
 	sb, ob := RunServerWithConfig(conf)
 	defer sb.Shutdown()
 
@@ -3711,14 +3707,14 @@ func TestMonitorLeafz(t *testing.T) {
 		return acc, creds
 	}
 	acc1, mycreds1 := createAcc(t)
-	defer removeFile(t, mycreds1)
 	acc2, mycreds2 := createAcc(t)
-	defer removeFile(t, mycreds2)
+	leafName := "my-leaf-node"
 
 	content = `
 		port: -1
 		http: "127.0.0.1:-1"
 		ping_interval = 1
+		server_name: %s
 		accounts {
 			%s {
 				users [
@@ -3747,11 +3743,11 @@ func TestMonitorLeafz(t *testing.T) {
 		}
 		`
 	config := fmt.Sprintf(content,
+		leafName,
 		acc1.Name, acc2.Name,
 		acc1.Name, ob.LeafNode.Port, mycreds1,
 		acc2.Name, ob.LeafNode.Port, mycreds2)
 	conf = createConfFile(t, []byte(config))
-	defer removeFile(t, conf)
 	sa, oa := RunServerWithConfig(conf)
 	defer sa.Shutdown()
 
@@ -3821,6 +3817,12 @@ func TestMonitorLeafz(t *testing.T) {
 				}
 			} else {
 				t.Fatalf("Expected account to be %q or %q, got %q", acc1.Name, acc2.Name, ln.Account)
+			}
+			if ln.Name != "hub" {
+				t.Fatalf("Expected name to be %q, got %q", "hub", ln.Name)
+			}
+			if !ln.IsSpoke {
+				t.Fatal("Expected leafnode connection to be spoke")
 			}
 			if ln.RTT == "" {
 				t.Fatalf("RTT not tracked?")
@@ -3909,6 +3911,12 @@ func TestMonitorLeafz(t *testing.T) {
 				}
 			} else {
 				t.Fatalf("Expected account to be %q or %q, got %q", acc1.Name, acc2.Name, ln.Account)
+			}
+			if ln.Name != leafName {
+				t.Fatalf("Expected name to be %q, got %q", leafName, ln.Name)
+			}
+			if ln.IsSpoke {
+				t.Fatal("Expected leafnode connection to be hub")
 			}
 			if ln.RTT == "" {
 				t.Fatalf("RTT not tracked?")
@@ -4092,8 +4100,7 @@ func TestMonitorJsz(t *testing.T) {
 		{7500, 7501, 7502, 5502},
 		{5500, 5501, 5502, 7502},
 	} {
-		tmpDir := createDir(t, fmt.Sprintf("srv_%d", test.port))
-		defer removeDir(t, tmpDir)
+		tmpDir := t.TempDir()
 		cf := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:%d
 		http: 127.0.0.1:%d
@@ -4123,7 +4130,6 @@ func TestMonitorJsz(t *testing.T) {
 			routes: [nats-route://127.0.0.1:%d]
 		}
 		server_name: server_%d `, test.port, test.mport, tmpDir, test.cport, test.routed, test.port)))
-		defer removeFile(t, cf)
 
 		s, _ := RunServerWithConfig(cf)
 		defer s.Shutdown()
@@ -4175,7 +4181,7 @@ func TestMonitorJsz(t *testing.T) {
 	_, err = js.Publish("foo", nil)
 	require_NoError(t, err)
 	// Wait for mirror replication
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	monUrl1 := fmt.Sprintf("http://127.0.0.1:%d/jsz", 7501)
 	monUrl2 := fmt.Sprintf("http://127.0.0.1:%d/jsz", 5501)
@@ -4318,6 +4324,9 @@ func TestMonitorJsz(t *testing.T) {
 			if info.AccountDetails[0].Streams[0].Consumer[0].Config != nil {
 				t.Fatal("Config expected to not be present")
 			}
+			if len(info.AccountDetails[0].Streams[0].ConsumerRaftGroups) != 0 {
+				t.Fatalf("expected consumer raft groups to not be returned by %s but got %v", url, info)
+			}
 		}
 	})
 	t.Run("config", func(t *testing.T) {
@@ -4393,6 +4402,39 @@ func TestMonitorJsz(t *testing.T) {
 			}
 		}
 	})
+	t.Run("raftgroups", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?acc=ACC&consumers=true&raft=true")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+
+			// We will have two streams and order is not guaranteed. So grab the one we want.
+			var si StreamDetail
+			if info.AccountDetails[0].Streams[0].Name == "my-stream-replicated" {
+				si = info.AccountDetails[0].Streams[0]
+			} else {
+				si = info.AccountDetails[0].Streams[1]
+			}
+
+			if len(si.Consumer) == 0 {
+				t.Fatalf("expected consumers to be returned by %s but got %v", url, info)
+			}
+			if len(si.ConsumerRaftGroups) == 0 {
+				t.Fatalf("expected consumer raft groups to be returned by %s but got %v", url, info)
+			}
+			if len(si.RaftGroup) == 0 {
+				t.Fatal("expected stream raft group info to be included")
+			}
+			crgroup := si.ConsumerRaftGroups[0]
+			if crgroup.Name != "my-consumer-replicated" && crgroup.Name != "my-consumer-mirror" {
+				t.Fatalf("expected consumer name to be included in raft group info, got: %v", crgroup.Name)
+			}
+			if len(crgroup.RaftGroup) == 0 {
+				t.Fatal("expected consumer raft group info to be included")
+			}
+		}
+	})
 }
 
 func TestMonitorReloadTLSConfig(t *testing.T) {
@@ -4412,7 +4454,6 @@ func TestMonitorReloadTLSConfig(t *testing.T) {
 	conf := createConfFile(t, []byte(fmt.Sprintf(template,
 		"../test/configs/certs/server-noip.pem",
 		"../test/configs/certs/server-key-noip.pem")))
-	defer removeFile(t, conf)
 
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()

@@ -1,4 +1,4 @@
-// Copyright 2012-2019 The NATS Authors
+// Copyright 2015-2023 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -10,36 +10,27 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Copied from pse_openbsd.go
 
-package test
+package pse
 
 import (
 	"fmt"
 	"os"
-	"testing"
+	"os/exec"
 )
 
-func TestPidFile(t *testing.T) {
-	opts := DefaultTestOptions
-
-	file := createTempFile(t, "nats-server:pid_")
-	file.Close()
-	opts.PidFile = file.Name()
-
-	s := RunServer(&opts)
-	s.Shutdown()
-
-	buf, err := os.ReadFile(opts.PidFile)
+// ProcUsage returns CPU usage
+func ProcUsage(pcpu *float64, rss, vss *int64) error {
+	pidStr := fmt.Sprintf("%d", os.Getpid())
+	out, err := exec.Command("ps", "o", "pcpu=,rss=,vsz=", "-p", pidStr).Output()
 	if err != nil {
-		t.Fatalf("Could not read pid_file: %v", err)
+		*rss, *vss = -1, -1
+		return fmt.Errorf("ps call failed:%v", err)
 	}
-	if len(buf) <= 0 {
-		t.Fatal("Expected a non-zero length pid_file")
-	}
-
-	pid := 0
-	fmt.Sscanf(string(buf), "%d", &pid)
-	if pid != os.Getpid() {
-		t.Fatalf("Expected pid to be %d, got %d\n", os.Getpid(), pid)
-	}
+	fmt.Sscanf(string(out), "%f %d %d", pcpu, rss, vss)
+	*rss *= 1024 // 1k blocks, want bytes.
+	*vss *= 1024 // 1k blocks, want bytes.
+	return nil
 }

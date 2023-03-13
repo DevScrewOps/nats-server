@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"reflect"
@@ -217,97 +218,6 @@ func TestJetStreamClusterCreateConsumerWithReplicaOneGetsResponse(t *testing.T) 
 	require_True(t, len(ci.Cluster.Replicas) == 0)
 }
 
-func TestJetStreamClusterConsumerListPaging(t *testing.T) {
-	c := createJetStreamClusterExplicit(t, "R3S", 3)
-	defer c.shutdown()
-
-	s := c.randomNonLeader()
-	nc, js := jsClientConnect(t, s)
-	defer nc.Close()
-
-	_, err := js.AddStream(&nats.StreamConfig{
-		Name:     "TEST",
-		Subjects: []string{"foo"},
-		Replicas: 3,
-	})
-	require_NoError(t, err)
-
-	cfg := &nats.ConsumerConfig{
-		Replicas:      1,
-		MemoryStorage: true,
-		AckPolicy:     nats.AckExplicitPolicy,
-	}
-
-	// create 3000 consumers.
-	numConsumers := 3000
-	for i := 1; i <= numConsumers; i++ {
-		cfg.Durable = fmt.Sprintf("d-%.4d", i)
-		_, err := js.AddConsumer("TEST", cfg)
-		require_NoError(t, err)
-	}
-
-	// Test both names and list operations.
-
-	// Names
-	reqSubj := fmt.Sprintf(JSApiConsumersT, "TEST")
-	grabConsumerNames := func(offset int) []string {
-		req := fmt.Sprintf(`{"offset":%d}`, offset)
-		respMsg, err := nc.Request(reqSubj, []byte(req), time.Second)
-		require_NoError(t, err)
-		var resp JSApiConsumerNamesResponse
-		err = json.Unmarshal(respMsg.Data, &resp)
-		require_NoError(t, err)
-		// Sanity check that we are actually paging properly around limits.
-		if resp.Limit < len(resp.Consumers) {
-			t.Fatalf("Expected total limited to %d but got %d", resp.Limit, len(resp.Consumers))
-		}
-		return resp.Consumers
-	}
-
-	results := make(map[string]bool)
-
-	for offset := 0; len(results) < numConsumers; {
-		consumers := grabConsumerNames(offset)
-		offset += len(consumers)
-		for _, name := range consumers {
-			if results[name] {
-				t.Fatalf("Found duplicate %q", name)
-			}
-			results[name] = true
-		}
-	}
-
-	// List
-	reqSubj = fmt.Sprintf(JSApiConsumerListT, "TEST")
-	grabConsumerList := func(offset int) []*ConsumerInfo {
-		req := fmt.Sprintf(`{"offset":%d}`, offset)
-		respMsg, err := nc.Request(reqSubj, []byte(req), time.Second)
-		require_NoError(t, err)
-		var resp JSApiConsumerListResponse
-		err = json.Unmarshal(respMsg.Data, &resp)
-		require_NoError(t, err)
-		// Sanity check that we are actually paging properly around limits.
-		if resp.Limit < len(resp.Consumers) {
-			t.Fatalf("Expected total limited to %d but got %d", resp.Limit, len(resp.Consumers))
-		}
-		return resp.Consumers
-	}
-
-	results = make(map[string]bool)
-
-	for offset := 0; len(results) < numConsumers; {
-		consumers := grabConsumerList(offset)
-		offset += len(consumers)
-		for _, ci := range consumers {
-			name := ci.Config.Durable
-			if results[name] {
-				t.Fatalf("Found duplicate %q", name)
-			}
-			results[name] = true
-		}
-	}
-}
-
 func TestJetStreamClusterMetaRecoveryLogic(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -405,8 +315,8 @@ func TestJetStreamClusterDeleteConsumerWhileServerDown(t *testing.T) {
 	s = c.restartServer(s)
 	checkFor(t, time.Second, 200*time.Millisecond, func() error {
 		hs := s.healthz(&HealthzOptions{
-			JSEnabled:    true,
-			JSServerOnly: false,
+			JSEnabledOnly: false,
+			JSServerOnly:  false,
 		})
 		if hs.Error != _EMPTY_ {
 			return errors.New(hs.Error)
@@ -447,8 +357,8 @@ func TestJetStreamClusterDeleteConsumerWhileServerDown(t *testing.T) {
 	s = c.restartServer(s)
 	checkFor(t, time.Second, 200*time.Millisecond, func() error {
 		hs := s.healthz(&HealthzOptions{
-			JSEnabled:    true,
-			JSServerOnly: false,
+			JSEnabledOnly: false,
+			JSServerOnly:  false,
 		})
 		if hs.Error != _EMPTY_ {
 			return errors.New(hs.Error)
@@ -466,10 +376,7 @@ func TestJetStreamClusterDeleteConsumerWhileServerDown(t *testing.T) {
 }
 
 func TestJetStreamClusterNegativeReplicas(t *testing.T) {
-	s := RunBasicJetStreamServer()
-	if config := s.JetStreamConfig(); config != nil {
-		defer removeDir(t, config.StoreDir)
-	}
+	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
@@ -525,10 +432,7 @@ func TestJetStreamClusterNegativeReplicas(t *testing.T) {
 }
 
 func TestJetStreamClusterUserGivenConsName(t *testing.T) {
-	s := RunBasicJetStreamServer()
-	if config := s.JetStreamConfig(); config != nil {
-		defer removeDir(t, config.StoreDir)
-	}
+	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
@@ -734,7 +638,7 @@ func TestJetStreamClusterMirrorCrossDomainOnLeadnodeNoSystemShare(t *testing.T) 
 func TestJetStreamClusterFirstSeqMismatch(t *testing.T) {
 	c := createJetStreamClusterWithTemplateAndModHook(t, jsClusterTempl, "C", 3,
 		func(serverName, clusterName, storeDir, conf string) string {
-			tf := createFile(t, "")
+			tf := createTempFile(t, "")
 			logName := tf.Name()
 			tf.Close()
 			return fmt.Sprintf("%s\nlogfile: '%s'", conf, logName)
@@ -812,10 +716,7 @@ func TestJetStreamClusterFirstSeqMismatch(t *testing.T) {
 func TestJetStreamClusterConsumerInactiveThreshold(t *testing.T) {
 	// Create a standalone, a cluster, and a super cluster
 
-	s := RunBasicJetStreamServer()
-	if config := s.JetStreamConfig(); config != nil {
-		defer removeDir(t, config.StoreDir)
-	}
+	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
@@ -1030,7 +931,7 @@ func TestJetStreamClusterSignalPullConsumersOnDelete(t *testing.T) {
 	// We want to make sure we get kicked out prior to the timeout
 	// when consumers are being deleted or the parent stream is being deleted.
 	// Note this should be lower case, Go client needs to be updated.
-	expectedErr := errors.New("nats: Consumer Deleted")
+	expectedErr := errors.New("nats: consumer deleted")
 
 	// Queue up the delete for sub1
 	time.AfterFunc(250*time.Millisecond, func() { js.DeleteConsumer("TEST", "d1") })
@@ -1054,10 +955,7 @@ func TestJetStreamClusterSignalPullConsumersOnDelete(t *testing.T) {
 
 // https://github.com/nats-io/nats-server/issues/3559
 func TestJetStreamClusterSourceWithOptStartTime(t *testing.T) {
-	s := RunBasicJetStreamServer()
-	if config := s.JetStreamConfig(); config != nil {
-		defer removeDir(t, config.StoreDir)
-	}
+	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
@@ -1085,7 +983,7 @@ func TestJetStreamClusterSourceWithOptStartTime(t *testing.T) {
 		_, err = js.AddStream(&nats.StreamConfig{
 			Name:     "SOURCE",
 			Replicas: replicas,
-			Sources: []*nats.StreamSource{&nats.StreamSource{
+			Sources: []*nats.StreamSource{{
 				Name:         "TEST",
 				OptStartTime: &yesterday,
 			}},
@@ -1258,6 +1156,10 @@ func TestJetStreamClusterScaleDownWhileNoQuorum(t *testing.T) {
 		return fmt.Errorf("stream still has a leader")
 	})
 
+	// Make sure if meta leader was on same server as stream leader we make sure
+	// it elects new leader to receive update request.
+	c.waitOnLeader()
+
 	// Now try to edit the stream by making it an R1. In some case we get
 	// a context deadline error, in some no error. So don't check the returned error.
 	js.UpdateStream(&nats.StreamConfig{
@@ -1280,4 +1182,1744 @@ func TestJetStreamClusterScaleDownWhileNoQuorum(t *testing.T) {
 
 	checkClusterFormed(t, c.servers...)
 	c.waitOnStreamLeader(globalAccountName, "TEST")
+}
+
+// We noticed that ha_assets enforcement seemed to not be upheld when assets created in a rapid fashion.
+func TestJetStreamClusterHAssetsEnforcement(t *testing.T) {
+	tmpl := strings.Replace(jsClusterTempl, "store_dir:", "limits: {max_ha_assets: 2}, store_dir:", 1)
+	c := createJetStreamClusterWithTemplateAndModHook(t, tmpl, "R3S", 3, nil)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST-1",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "TEST-2",
+		Subjects: []string{"bar"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	exceededErrs := []error{errors.New("system limit reached"), errors.New("no suitable peers")}
+
+	// Should fail.
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "TEST-3",
+		Subjects: []string{"baz"},
+		Replicas: 3,
+	})
+	require_Error(t, err, exceededErrs...)
+}
+
+func TestJetStreamClusterInterestStreamConsumer(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R5S", 5)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Retention: nats.InterestPolicy,
+		Replicas:  3,
+	})
+	require_NoError(t, err)
+
+	var subs []*nats.Subscription
+	ns := 5
+
+	for i := 0; i < ns; i++ {
+		dn := fmt.Sprintf("d%d", i)
+		sub, err := js.PullSubscribe("foo", dn)
+		require_NoError(t, err)
+		subs = append(subs, sub)
+	}
+
+	// Send 10 msgs
+	n := 10
+	for i := 0; i < n; i++ {
+		sendStreamMsg(t, nc, "foo", "msg")
+	}
+
+	// Collect all the messages.
+	var msgs []*nats.Msg
+	for _, sub := range subs {
+		lmsgs := fetchMsgs(t, sub, n, time.Second)
+		if len(lmsgs) != n {
+			t.Fatalf("Did not receive all msgs: %d vs %d", len(lmsgs), n)
+		}
+		msgs = append(msgs, lmsgs...)
+	}
+
+	// Shuffle
+	rand.Shuffle(len(msgs), func(i, j int) { msgs[i], msgs[j] = msgs[j], msgs[i] })
+	for _, m := range msgs {
+		m.AckSync()
+	}
+	// Make sure replicated acks are processed.
+	time.Sleep(250 * time.Millisecond)
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+
+	if si.State.Msgs != 0 {
+		t.Fatalf("Should not have any messages left: %d of %d", si.State.Msgs, n)
+	}
+}
+
+func TestJetStreamClusterNoPanicOnStreamInfoWhenNoLeaderYet(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc := natsConnect(t, c.randomServer().ClientURL())
+	defer nc.Close()
+
+	js, _ := nc.JetStream(nats.MaxWait(500 * time.Millisecond))
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	ch := make(chan struct{})
+	go func() {
+		defer wg.Done()
+
+		for {
+			js.StreamInfo("TEST")
+			select {
+			case <-ch:
+				return
+			case <-time.After(15 * time.Millisecond):
+			}
+		}
+	}()
+
+	time.Sleep(250 * time.Millisecond)
+
+	// Don't care if this succeeds or not (could get a context deadline
+	// due to the low MaxWait() when creating the context).
+	js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+
+	close(ch)
+	wg.Wait()
+}
+
+// Issue https://github.com/nats-io/nats-server/issues/3630
+func TestJetStreamClusterPullConsumerAcksExtendInactivityThreshold(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+
+	n := 10
+	for i := 0; i < n; i++ {
+		sendStreamMsg(t, nc, "foo", "msg")
+	}
+
+	// Pull Consumer
+	sub, err := js.PullSubscribe("foo", "d", nats.InactiveThreshold(time.Second))
+	require_NoError(t, err)
+
+	fetchMsgs(t, sub, n/2, time.Second)
+	// Will wait for .5s.
+	time.Sleep(500 * time.Millisecond)
+	msgs := fetchMsgs(t, sub, n/2, time.Second)
+	if len(msgs) != n/2 {
+		t.Fatalf("Did not receive msgs: %d vs %d", len(msgs), n/2)
+	}
+
+	// Wait for .5s.
+	time.Sleep(500 * time.Millisecond)
+	msgs[0].Ack() // Ack
+	// Wait another .5s.
+	time.Sleep(500 * time.Millisecond)
+	msgs[1].Nak() // Nak
+	// Wait another .5s.
+	time.Sleep(500 * time.Millisecond)
+	msgs[2].Term() // Term
+	time.Sleep(500 * time.Millisecond)
+	msgs[3].InProgress() // WIP
+
+	// The above should have kept the consumer alive.
+	_, err = js.ConsumerInfo("TEST", "d")
+	require_NoError(t, err)
+
+	// Make sure it gets cleaned up.
+	time.Sleep(2 * time.Second)
+	_, err = js.ConsumerInfo("TEST", "d")
+	require_Error(t, err, nats.ErrConsumerNotFound)
+}
+
+// https://github.com/nats-io/nats-server/issues/3677
+func TestJetStreamParallelStreamCreation(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	np := 20
+
+	startCh := make(chan bool)
+	errCh := make(chan error, np)
+
+	wg := sync.WaitGroup{}
+	wg.Add(np)
+	for i := 0; i < np; i++ {
+		go func() {
+			defer wg.Done()
+
+			// Individual connection
+			nc, js := jsClientConnect(t, c.randomServer())
+			defer nc.Close()
+
+			// Make them all fire at once.
+			<-startCh
+
+			_, err := js.AddStream(&nats.StreamConfig{
+				Name:     "TEST",
+				Subjects: []string{"common.*.*"},
+				Replicas: 3,
+			})
+			if err != nil {
+				errCh <- err
+			}
+		}()
+	}
+
+	close(startCh)
+	wg.Wait()
+
+	if len(errCh) > 0 {
+		t.Fatalf("Expected no errors, got %d", len(errCh))
+	}
+}
+
+// In addition to test above, if streams were attempted to be created in parallel
+// it could be that multiple raft groups would be created for the same asset.
+func TestJetStreamParallelStreamCreationDupeRaftGroups(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	np := 20
+
+	startCh := make(chan bool)
+	wg := sync.WaitGroup{}
+	wg.Add(np)
+	for i := 0; i < np; i++ {
+		go func() {
+			defer wg.Done()
+
+			// Individual connection
+			nc, _ := jsClientConnect(t, c.randomServer())
+			js, _ := nc.JetStream(nats.MaxWait(time.Second))
+			defer nc.Close()
+
+			// Make them all fire at once.
+			<-startCh
+
+			// Ignore errors in this test, care about raft group and metastate.
+			js.AddStream(&nats.StreamConfig{
+				Name:     "TEST",
+				Subjects: []string{"common.*.*"},
+				Replicas: 3,
+			})
+		}()
+	}
+
+	close(startCh)
+	wg.Wait()
+
+	// Restart a server too.
+	s := c.randomServer()
+	s.Shutdown()
+	s = c.restartServer(s)
+	c.waitOnLeader()
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+	// Check that this server has only two active raft nodes after restart.
+	if nrn := s.numRaftNodes(); nrn != 2 {
+		t.Fatalf("Expected only two active raft nodes, got %d", nrn)
+	}
+
+	// Make sure we only have 2 unique raft groups for all servers.
+	// One for meta, one for stream.
+	expected := 2
+	rg := make(map[string]struct{})
+	for _, s := range c.servers {
+		s.mu.RLock()
+		for _, ni := range s.raftNodes {
+			n := ni.(*raft)
+			rg[n.Group()] = struct{}{}
+		}
+		s.mu.RUnlock()
+	}
+	if len(rg) != expected {
+		t.Fatalf("Expected only %d distinct raft groups for all servers, go %d", expected, len(rg))
+	}
+}
+
+func TestJetStreamParallelConsumerCreation(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"common.*.*"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	np := 50
+
+	startCh := make(chan bool)
+	errCh := make(chan error, np)
+
+	cfg := &nats.ConsumerConfig{
+		Durable:  "dlc",
+		Replicas: 3,
+	}
+
+	wg := sync.WaitGroup{}
+	swg := sync.WaitGroup{}
+	wg.Add(np)
+	swg.Add(np)
+
+	for i := 0; i < np; i++ {
+		go func() {
+			defer wg.Done()
+
+			// Individual connection
+			nc, js := jsClientConnect(t, c.randomServer())
+			defer nc.Close()
+
+			swg.Done()
+
+			// Make them all fire at once.
+			<-startCh
+
+			if _, err := js.AddConsumer("TEST", cfg); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+
+	swg.Wait()
+	close(startCh)
+
+	wg.Wait()
+
+	if len(errCh) > 0 {
+		t.Fatalf("Expected no errors, got %d", len(errCh))
+	}
+
+	// Make sure we only have 3 unique raft groups for all servers.
+	// One for meta, one for stream, one for consumer.
+	expected := 3
+	rg := make(map[string]struct{})
+	for _, s := range c.servers {
+		s.mu.RLock()
+		for _, ni := range s.raftNodes {
+			n := ni.(*raft)
+			rg[n.Group()] = struct{}{}
+		}
+		s.mu.RUnlock()
+	}
+	if len(rg) != expected {
+		t.Fatalf("Expected only %d distinct raft groups for all servers, go %d", expected, len(rg))
+	}
+}
+
+func TestJetStreamGhostEphemeralsAfterRestart(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// Add in 100 memory based ephemerals.
+	for i := 0; i < 100; i++ {
+		_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Replicas:          1,
+			InactiveThreshold: time.Second,
+			MemoryStorage:     true,
+		})
+		require_NoError(t, err)
+	}
+
+	// Grab random server.
+	rs := c.randomServer()
+	// Now shutdown cluster.
+	c.stopAll()
+
+	// Let the consumers all expire.
+	time.Sleep(2 * time.Second)
+
+	// Restart first and wait so that we know it will try cleanup without a metaleader.
+	c.restartServer(rs)
+	time.Sleep(time.Second)
+
+	c.restartAll()
+	c.waitOnLeader()
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+
+	nc, _ = jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	subj := fmt.Sprintf(JSApiConsumerListT, "TEST")
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
+		m, err := nc.Request(subj, nil, time.Second)
+		if err != nil {
+			return err
+		}
+		var resp JSApiConsumerListResponse
+		err = json.Unmarshal(m.Data, &resp)
+		require_NoError(t, err)
+		if len(resp.Consumers) != 0 {
+			return fmt.Errorf("Still have %d consumers", len(resp.Consumers))
+		}
+		if len(resp.Missing) != 0 {
+			return fmt.Errorf("Still have %d missing consumers", len(resp.Missing))
+		}
+
+		return nil
+	})
+}
+
+func TestJetStreamClusterReplacementPolicyAfterPeerRemove(t *testing.T) {
+	// R3 scenario where there is a redundant node in each unique cloud so removing a peer should result in
+	// an immediate replacement also preserving cloud uniqueness.
+
+	sc := createJetStreamClusterExplicit(t, "PR9", 9)
+	sc.waitOnPeerCount(9)
+
+	reset := func(s *Server) {
+		s.mu.Lock()
+		rch := s.sys.resetCh
+		s.mu.Unlock()
+		if rch != nil {
+			rch <- struct{}{}
+		}
+		s.sendStatszUpdate()
+	}
+
+	tags := []string{"cloud:aws", "cloud:aws", "cloud:aws", "cloud:gcp", "cloud:gcp", "cloud:gcp", "cloud:az", "cloud:az", "cloud:az"}
+
+	var serverUTags = make(map[string]string)
+
+	for i, s := range sc.servers {
+		s.optsMu.Lock()
+		serverUTags[s.Name()] = tags[i]
+		s.opts.Tags.Add(tags[i])
+		s.opts.JetStreamUniqueTag = "cloud"
+		s.optsMu.Unlock()
+		reset(s)
+	}
+
+	ml := sc.leader()
+	js := ml.getJetStream()
+	require_True(t, js != nil)
+	js.mu.RLock()
+	cc := js.cluster
+	require_True(t, cc != nil)
+
+	// Walk and make sure all tags are registered.
+	expires := time.Now().Add(10 * time.Second)
+	for time.Now().Before(expires) {
+		allOK := true
+		for _, p := range cc.meta.Peers() {
+			si, ok := ml.nodeToInfo.Load(p.ID)
+			require_True(t, ok)
+			ni := si.(nodeInfo)
+			if len(ni.tags) == 0 {
+				allOK = false
+				reset(sc.serverByName(ni.name))
+			}
+		}
+		if allOK {
+			break
+		}
+	}
+	js.mu.RUnlock()
+	defer sc.shutdown()
+
+	sc.waitOnClusterReadyWithNumPeers(9)
+
+	s := sc.leader()
+	nc, jsc := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := jsc.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	sc.waitOnStreamLeader(globalAccountName, "TEST")
+
+	osi, err := jsc.StreamInfo("TEST")
+	require_NoError(t, err)
+
+	// Double check original placement honors unique_tag
+	var uTags = make(map[string]struct{})
+
+	uTags[serverUTags[osi.Cluster.Leader]] = struct{}{}
+	for _, replica := range osi.Cluster.Replicas {
+		evalTag := serverUTags[replica.Name]
+		if _, exists := uTags[evalTag]; !exists {
+			uTags[evalTag] = struct{}{}
+			continue
+		} else {
+			t.Fatalf("expected initial placement to honor unique_tag")
+		}
+	}
+
+	// Remove a peer and select replacement 5 times to avoid false good
+	for i := 0; i < 5; i++ {
+		// Remove 1 peer replica (this will be random cloud region as initial placement was randomized ordering)
+		// After each successful iteration, osi will reflect the current RG peers
+		toRemove := osi.Cluster.Replicas[0].Name
+		resp, err := nc.Request(fmt.Sprintf(JSApiStreamRemovePeerT, "TEST"), []byte(`{"peer":"`+toRemove+`"}`), time.Second)
+		require_NoError(t, err)
+		var rpResp JSApiStreamRemovePeerResponse
+		err = json.Unmarshal(resp.Data, &rpResp)
+		require_NoError(t, err)
+		require_True(t, rpResp.Success)
+
+		sc.waitOnStreamLeader(globalAccountName, "TEST")
+
+		checkFor(t, time.Second, 200*time.Millisecond, func() error {
+			osi, err = jsc.StreamInfo("TEST")
+			require_NoError(t, err)
+			if len(osi.Cluster.Replicas) != 2 {
+				return fmt.Errorf("expected R3, got R%d", len(osi.Cluster.Replicas)+1)
+			}
+			// STREAM.PEER.REMOVE is asynchronous command; make sure remove has occurred by
+			// checking that the toRemove peer is gone.
+			for _, replica := range osi.Cluster.Replicas {
+				if replica.Name == toRemove {
+					return fmt.Errorf("expected replaced replica, old replica still present")
+				}
+			}
+			return nil
+		})
+
+		// Validate that replacement with new peer still honors
+		uTags = make(map[string]struct{}) //reset
+
+		uTags[serverUTags[osi.Cluster.Leader]] = struct{}{}
+		for _, replica := range osi.Cluster.Replicas {
+			evalTag := serverUTags[replica.Name]
+			if _, exists := uTags[evalTag]; !exists {
+				uTags[evalTag] = struct{}{}
+				continue
+			} else {
+				t.Fatalf("expected new peer and revised placement to honor unique_tag")
+			}
+		}
+	}
+}
+
+func TestJetStreamClusterReplacementPolicyAfterPeerRemoveNoPlace(t *testing.T) {
+	// R3 scenario where there are exactly three unique cloud nodes, so removing a peer should NOT
+	// result in a new peer
+
+	sc := createJetStreamClusterExplicit(t, "threeup", 3)
+	sc.waitOnPeerCount(3)
+
+	reset := func(s *Server) {
+		s.mu.Lock()
+		rch := s.sys.resetCh
+		s.mu.Unlock()
+		if rch != nil {
+			rch <- struct{}{}
+		}
+		s.sendStatszUpdate()
+	}
+
+	tags := []string{"cloud:aws", "cloud:gcp", "cloud:az"}
+
+	var serverUTags = make(map[string]string)
+
+	for i, s := range sc.servers {
+		s.optsMu.Lock()
+		serverUTags[s.Name()] = tags[i]
+		s.opts.Tags.Add(tags[i])
+		s.opts.JetStreamUniqueTag = "cloud"
+		s.optsMu.Unlock()
+		reset(s)
+	}
+
+	ml := sc.leader()
+	js := ml.getJetStream()
+	require_True(t, js != nil)
+	js.mu.RLock()
+	cc := js.cluster
+	require_True(t, cc != nil)
+
+	// Walk and make sure all tags are registered.
+	expires := time.Now().Add(10 * time.Second)
+	for time.Now().Before(expires) {
+		allOK := true
+		for _, p := range cc.meta.Peers() {
+			si, ok := ml.nodeToInfo.Load(p.ID)
+			require_True(t, ok)
+			ni := si.(nodeInfo)
+			if len(ni.tags) == 0 {
+				allOK = false
+				reset(sc.serverByName(ni.name))
+			}
+		}
+		if allOK {
+			break
+		}
+	}
+	js.mu.RUnlock()
+	defer sc.shutdown()
+
+	sc.waitOnClusterReadyWithNumPeers(3)
+
+	s := sc.leader()
+	nc, jsc := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := jsc.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	sc.waitOnStreamLeader(globalAccountName, "TEST")
+
+	osi, err := jsc.StreamInfo("TEST")
+	require_NoError(t, err)
+
+	// Double check original placement honors unique_tag
+	var uTags = make(map[string]struct{})
+
+	uTags[serverUTags[osi.Cluster.Leader]] = struct{}{}
+	for _, replica := range osi.Cluster.Replicas {
+		evalTag := serverUTags[replica.Name]
+		if _, exists := uTags[evalTag]; !exists {
+			uTags[evalTag] = struct{}{}
+			continue
+		} else {
+			t.Fatalf("expected initial placement to honor unique_tag")
+		}
+	}
+
+	// Remove 1 peer replica (this will be random cloud region as initial placement was randomized ordering)
+	_, err = nc.Request("$JS.API.STREAM.PEER.REMOVE.TEST", []byte(`{"peer":"`+osi.Cluster.Replicas[0].Name+`"}`), time.Second*10)
+	require_NoError(t, err)
+
+	sc.waitOnStreamLeader(globalAccountName, "TEST")
+
+	// Verify R2 since no eligible peer can replace the removed peer without braking unique constraint
+	checkFor(t, time.Second, 200*time.Millisecond, func() error {
+		osi, err = jsc.StreamInfo("TEST")
+		require_NoError(t, err)
+		if len(osi.Cluster.Replicas) != 1 {
+			return fmt.Errorf("expected R2, got R%d", len(osi.Cluster.Replicas)+1)
+		}
+		return nil
+	})
+
+	// Validate that remaining members still honor unique tags
+	uTags = make(map[string]struct{}) //reset
+
+	uTags[serverUTags[osi.Cluster.Leader]] = struct{}{}
+	for _, replica := range osi.Cluster.Replicas {
+		evalTag := serverUTags[replica.Name]
+		if _, exists := uTags[evalTag]; !exists {
+			uTags[evalTag] = struct{}{}
+			continue
+		} else {
+			t.Fatalf("expected revised placement to honor unique_tag")
+		}
+	}
+}
+
+// https://github.com/nats-io/nats-server/issues/3191
+func TestJetStreamClusterLeafnodeDuplicateConsumerMessages(t *testing.T) {
+	// Cluster B
+	c := createJetStreamCluster(t, jsClusterTempl, "B", _EMPTY_, 2, 22020, false)
+	defer c.shutdown()
+
+	// Cluster A
+	// Domain is "A'
+	lc := c.createLeafNodesWithStartPortAndDomain("A", 2, 22110, "A")
+	defer lc.shutdown()
+
+	lc.waitOnClusterReady()
+
+	// We want A-S-1 connected to B-S-1 and A-S-2 connected to B-S-2
+	// So adjust if needed.
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		for i, ls := range lc.servers {
+			ls.mu.RLock()
+			var remoteServer string
+			for _, rc := range ls.leafs {
+				rc.mu.Lock()
+				remoteServer = rc.leaf.remoteServer
+				rc.mu.Unlock()
+				break
+			}
+			ls.mu.RUnlock()
+
+			wantedRemote := fmt.Sprintf("S-%d", i+1)
+			if remoteServer != wantedRemote {
+				ls.Shutdown()
+				lc.restartServer(ls)
+				return fmt.Errorf("Leafnode server %d not connected to %q", i+1, wantedRemote)
+			}
+		}
+		return nil
+	})
+
+	// Wait on ready again.
+	lc.waitOnClusterReady()
+
+	// Create a stream and a durable pull consumer on cluster A.
+	lnc, ljs := jsClientConnect(t, lc.randomServer())
+	defer lnc.Close()
+
+	_, err := ljs.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 2,
+	})
+	require_NoError(t, err)
+
+	// Make sure stream leader is on S-1
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		si, err := ljs.StreamInfo("TEST")
+		require_NoError(t, err)
+		if si.Cluster.Leader == "A-S-1" {
+			return nil
+		}
+		_, err = lnc.Request(fmt.Sprintf(JSApiStreamLeaderStepDownT, "TEST"), nil, time.Second)
+		require_NoError(t, err)
+		return fmt.Errorf("Stream leader not placed on A-S-1")
+	})
+
+	_, err = ljs.StreamInfo("TEST")
+	require_NoError(t, err)
+
+	_, err = ljs.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:    "dlc",
+		Replicas:   2,
+		MaxDeliver: 1,
+		AckPolicy:  nats.AckNonePolicy,
+	})
+	require_NoError(t, err)
+
+	// Make sure consumer leader is on S-2
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		ci, err := ljs.ConsumerInfo("TEST", "dlc")
+		require_NoError(t, err)
+		if ci.Cluster.Leader == "A-S-2" {
+			return nil
+		}
+		_, err = lnc.Request(fmt.Sprintf(JSApiConsumerLeaderStepDownT, "TEST", "dlc"), nil, time.Second)
+		require_NoError(t, err)
+		return fmt.Errorf("Stream leader not placed on A-S-1")
+	})
+
+	_, err = ljs.ConsumerInfo("TEST", "dlc")
+	require_NoError(t, err)
+
+	// Send 2 messages.
+	sendStreamMsg(t, lnc, "foo", "M-1")
+	sendStreamMsg(t, lnc, "foo", "M-2")
+
+	// Now bind apps to cluster B servers and bind to pull consumer.
+	nc1, _ := jsClientConnect(t, c.servers[0])
+	defer nc1.Close()
+	js1, err := nc1.JetStream(nats.Domain("A"))
+	require_NoError(t, err)
+
+	sub1, err := js1.PullSubscribe("foo", "dlc", nats.BindStream("TEST"))
+	require_NoError(t, err)
+	defer sub1.Unsubscribe()
+
+	nc2, _ := jsClientConnect(t, c.servers[1])
+	defer nc2.Close()
+	js2, err := nc2.JetStream(nats.Domain("A"))
+	require_NoError(t, err)
+
+	sub2, err := js2.PullSubscribe("foo", "dlc", nats.BindStream("TEST"))
+	require_NoError(t, err)
+	defer sub2.Unsubscribe()
+
+	// Make sure we can properly get messages.
+	msgs, err := sub1.Fetch(1)
+	require_NoError(t, err)
+	require_True(t, len(msgs) == 1)
+	require_True(t, string(msgs[0].Data) == "M-1")
+
+	msgs, err = sub2.Fetch(1)
+	require_NoError(t, err)
+	require_True(t, len(msgs) == 1)
+	require_True(t, string(msgs[0].Data) == "M-2")
+
+	// Make sure delivered state makes it to other server to not accidentally send M-2 again
+	// and fail the test below.
+	time.Sleep(250 * time.Millisecond)
+
+	// Now let's introduce and event, where A-S-2 will now reconnect after a restart to B-S-2
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		ls := lc.servers[1]
+		wantedRemote := "S-1"
+		var remoteServer string
+
+		ls.mu.RLock()
+		for _, rc := range ls.leafs {
+			rc.mu.Lock()
+			remoteServer = rc.leaf.remoteServer
+			rc.mu.Unlock()
+			break
+		}
+		ls.mu.RUnlock()
+
+		if remoteServer != wantedRemote {
+			ls.Shutdown()
+			lc.restartServer(ls)
+			return fmt.Errorf("Leafnode server not connected to %q", wantedRemote)
+		}
+		return nil
+	})
+
+	// Wait on ready again.
+	lc.waitOnClusterReady()
+	lc.waitOnStreamLeader(globalAccountName, "TEST")
+	lc.waitOnConsumerLeader(globalAccountName, "TEST", "dlc")
+
+	// Send 2 more messages.
+	sendStreamMsg(t, lnc, "foo", "M-3")
+	sendStreamMsg(t, lnc, "foo", "M-4")
+
+	msgs, err = sub1.Fetch(2)
+	require_NoError(t, err)
+	require_True(t, len(msgs) == 2)
+	require_True(t, string(msgs[0].Data) == "M-3")
+	require_True(t, string(msgs[1].Data) == "M-4")
+
+	// Send 2 more messages.
+	sendStreamMsg(t, lnc, "foo", "M-5")
+	sendStreamMsg(t, lnc, "foo", "M-6")
+
+	msgs, err = sub2.Fetch(2)
+	require_NoError(t, err)
+	require_True(t, len(msgs) == 2)
+	require_True(t, string(msgs[0].Data) == "M-5")
+	require_True(t, string(msgs[1].Data) == "M-6")
+}
+
+func snapRGSet(pFlag bool, banner string, osi *nats.StreamInfo) *map[string]struct{} {
+	var snapSet = make(map[string]struct{})
+	if pFlag {
+		fmt.Println(banner)
+	}
+	if osi == nil {
+		if pFlag {
+			fmt.Printf("bonkers!\n")
+		}
+		return nil
+	}
+
+	snapSet[osi.Cluster.Leader] = struct{}{}
+	if pFlag {
+		fmt.Printf("Leader: %s\n", osi.Cluster.Leader)
+	}
+	for _, replica := range osi.Cluster.Replicas {
+		snapSet[replica.Name] = struct{}{}
+		if pFlag {
+			fmt.Printf("Replica: %s\n", replica.Name)
+		}
+	}
+
+	return &snapSet
+}
+
+func TestJetStreamClusterAfterPeerRemoveZeroState(t *testing.T) {
+	// R3 scenario (w/messages) in a 4-node cluster. Peer remove from RG and add back to same RG later.
+	// Validate that original peer brought no memory or issues from its previous RG tour of duty, specifically
+	// that the restored peer has the correct filestore usage bytes for the asset.
+	var err error
+
+	sc := createJetStreamClusterExplicit(t, "cl4", 4)
+	defer sc.shutdown()
+
+	sc.waitOnClusterReadyWithNumPeers(4)
+
+	s := sc.leader()
+	nc, jsc := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err = jsc.AddStream(&nats.StreamConfig{
+		Name:     "foo",
+		Subjects: []string{"foo.*"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	sc.waitOnStreamLeader(globalAccountName, "foo")
+
+	osi, err := jsc.StreamInfo("foo")
+	require_NoError(t, err)
+
+	// make sure 0 msgs
+	require_True(t, osi.State.Msgs == 0)
+
+	// load up messages
+	toSend := 10000
+	// storage bytes with JS message overhead
+	assetStoreBytesExpected := uint64(460000)
+
+	for i := 1; i <= toSend; i++ {
+		msg := []byte("Hello World")
+		if _, err = jsc.Publish("foo.a", msg); err != nil {
+			t.Fatalf("unexpected publish error: %v", err)
+		}
+	}
+
+	osi, err = jsc.StreamInfo("foo")
+	require_NoError(t, err)
+
+	// make sure 10000 msgs
+	require_True(t, osi.State.Msgs == uint64(toSend))
+
+	origSet := *snapRGSet(false, "== Orig RG Set ==", osi)
+
+	// remove 1 peer replica (1 of 2 non-leaders)
+	origPeer := osi.Cluster.Replicas[0].Name
+	resp, err := nc.Request(fmt.Sprintf(JSApiStreamRemovePeerT, "foo"), []byte(`{"peer":"`+origPeer+`"}`), time.Second)
+	require_NoError(t, err)
+	var rpResp JSApiStreamRemovePeerResponse
+	err = json.Unmarshal(resp.Data, &rpResp)
+	require_NoError(t, err)
+	require_True(t, rpResp.Success)
+
+	// validate the origPeer is removed with a replacement newPeer
+	sc.waitOnStreamLeader(globalAccountName, "foo")
+	checkFor(t, time.Second, 200*time.Millisecond, func() error {
+		osi, err = jsc.StreamInfo("foo")
+		require_NoError(t, err)
+		if len(osi.Cluster.Replicas) != 2 {
+			return fmt.Errorf("expected R3, got R%d", len(osi.Cluster.Replicas)+1)
+		}
+		// STREAM.PEER.REMOVE is asynchronous command; make sure remove has occurred
+		for _, replica := range osi.Cluster.Replicas {
+			if replica.Name == origPeer {
+				return fmt.Errorf("expected replaced replica, old replica still present")
+			}
+		}
+		return nil
+	})
+
+	// identify the new peer
+	var newPeer string
+	osi, err = jsc.StreamInfo("foo")
+	require_NoError(t, err)
+	newSet := *snapRGSet(false, "== New RG Set ==", osi)
+	for peer := range newSet {
+		_, ok := origSet[peer]
+		if !ok {
+			newPeer = peer
+			break
+		}
+	}
+	require_True(t, newPeer != "")
+
+	// kick out newPeer which will cause origPeer to be assigned to the RG again
+	resp, err = nc.Request(fmt.Sprintf(JSApiStreamRemovePeerT, "foo"), []byte(`{"peer":"`+newPeer+`"}`), time.Second)
+	require_NoError(t, err)
+	err = json.Unmarshal(resp.Data, &rpResp)
+	require_NoError(t, err)
+	require_True(t, rpResp.Success)
+
+	// validate the newPeer is removed and R3 has reformed (with origPeer)
+	sc.waitOnStreamLeader(globalAccountName, "foo")
+	checkFor(t, time.Second, 200*time.Millisecond, func() error {
+		osi, err = jsc.StreamInfo("foo")
+		require_NoError(t, err)
+		if len(osi.Cluster.Replicas) != 2 {
+			return fmt.Errorf("expected R3, got R%d", len(osi.Cluster.Replicas)+1)
+		}
+		// STREAM.PEER.REMOVE is asynchronous command; make sure remove has occurred
+		for _, replica := range osi.Cluster.Replicas {
+			if replica.Name == newPeer {
+				return fmt.Errorf("expected replaced replica, old replica still present")
+			}
+		}
+		return nil
+	})
+
+	osi, err = jsc.StreamInfo("foo")
+	require_NoError(t, err)
+
+	// make sure all msgs reported in stream at this point with original leader
+	require_True(t, osi.State.Msgs == uint64(toSend))
+
+	snapRGSet(false, "== RG Set w/origPeer Back ==", osi)
+
+	// get a handle to original peer server
+	var origServer *Server = sc.serverByName(origPeer)
+	if origServer == nil {
+		t.Fatalf("expected to get a handle to original peer server by name")
+	}
+
+	checkFor(t, time.Second, 200*time.Millisecond, func() error {
+		jszResult, err := origServer.Jsz(nil)
+		require_NoError(t, err)
+		if jszResult.Store != assetStoreBytesExpected {
+			return fmt.Errorf("expected %d storage on orig peer, got %d", assetStoreBytesExpected, jszResult.Store)
+		}
+		return nil
+	})
+}
+
+func TestJetStreamClusterMemLeaderRestart(t *testing.T) {
+	// Test if R3 clustered mem store asset leader server restarted, that asset remains stable with final quorum
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	ml := c.leader()
+	nc, jsc := jsClientConnect(t, ml)
+	defer nc.Close()
+
+	_, err := jsc.AddStream(&nats.StreamConfig{
+		Name:     "foo",
+		Storage:  nats.MemoryStorage,
+		Subjects: []string{"foo.*"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// load up messages
+	toSend := 10000
+	for i := 1; i <= toSend; i++ {
+		msg := []byte("Hello World")
+		if _, err = jsc.Publish("foo.a", msg); err != nil {
+			t.Fatalf("unexpected publish error: %v", err)
+		}
+	}
+
+	osi, err := jsc.StreamInfo("foo")
+	require_NoError(t, err)
+	// make sure 10000 msgs
+	require_True(t, osi.State.Msgs == uint64(toSend))
+
+	// Shutdown the stream leader server
+	rs := c.serverByName(osi.Cluster.Leader)
+	rs.Shutdown()
+
+	// Make sure that we have a META leader (there can always be a re-election)
+	c.waitOnLeader()
+
+	// Should still have quorum and a new leader
+	checkFor(t, time.Second, 200*time.Millisecond, func() error {
+		osi, err = jsc.StreamInfo("foo")
+		if err != nil {
+			return fmt.Errorf("expected healthy stream asset, got %s", err.Error())
+		}
+		if osi.Cluster.Leader == "" {
+			return fmt.Errorf("expected healthy stream asset with new leader")
+		}
+		if osi.State.Msgs != uint64(toSend) {
+			return fmt.Errorf("expected healthy stream asset %d messages, got %d messages", toSend, osi.State.Msgs)
+		}
+		return nil
+	})
+
+	// Now restart the old leader peer (old stream state)
+	oldrs := rs
+	rs, _ = RunServerWithConfig(rs.getOpts().ConfigFile)
+	defer rs.Shutdown()
+
+	// Replaced old with new server
+	for i := 0; i < len(c.servers); i++ {
+		if c.servers[i] == oldrs {
+			c.servers[i] = rs
+		}
+	}
+
+	// Wait for cluster to be formed
+	checkClusterFormed(t, c.servers...)
+
+	// Make sure that we have a leader (there can always be a re-election)
+	c.waitOnLeader()
+
+	// Can we get stream info after return
+	osi, err = jsc.StreamInfo("foo")
+	if err != nil {
+		t.Fatalf("expected stream asset info return, got %s", err.Error())
+	}
+
+	// When asset leader came back did we re-form with quorum
+	if osi.Cluster.Leader == "" {
+		t.Fatalf("expected a current leader after old leader restarted")
+	}
+}
+
+// Customer reported R1 consumers that seemed to be ghosted after server restart.
+func TestJetStreamClusterLostConsumers(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "GHOST", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"events.>"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	for i := 0; i < 10; i++ {
+		for j := 0; j < 10; j++ {
+			_, err := js.Publish(fmt.Sprintf("events.%d.%d", i, j), []byte("test"))
+			require_NoError(t, err)
+		}
+	}
+
+	s := c.randomServer()
+	s.Shutdown()
+
+	c.waitOnLeader()
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+
+	nc, _ = jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	cc := CreateConsumerRequest{
+		Stream: "TEST",
+		Config: ConsumerConfig{
+			AckPolicy: AckExplicit,
+		},
+	}
+	req, err := json.Marshal(cc)
+	require_NoError(t, err)
+
+	reqSubj := fmt.Sprintf(JSApiConsumerCreateT, "TEST")
+
+	// Now create 50 consumers. We do not wait for the answer.
+	for i := 0; i < 50; i++ {
+		nc.Publish(reqSubj, req)
+	}
+	nc.Flush()
+
+	// Grab the meta leader.
+	ml := c.leader()
+	require_NoError(t, ml.JetStreamSnapshotMeta())
+
+	numConsumerAssignments := func(s *Server) int {
+		t.Helper()
+		js := s.getJetStream()
+		js.mu.RLock()
+		defer js.mu.RUnlock()
+		cc := js.cluster
+		for _, asa := range cc.streams {
+			for _, sa := range asa {
+				return len(sa.consumers)
+			}
+		}
+		return 0
+	}
+
+	checkFor(t, time.Second, 100*time.Millisecond, func() error {
+		num := numConsumerAssignments(ml)
+		if num == 50 {
+			return nil
+		}
+		return fmt.Errorf("Consumers is only %d", num)
+	})
+
+	// Restart the server we shutdown. We snapshotted to the snapshot
+	// has to fill in the new consumers.
+	// The bug would fail to add them to the meta state since the stream
+	// existed.
+	s = c.restartServer(s)
+
+	checkFor(t, time.Second, 100*time.Millisecond, func() error {
+		num := numConsumerAssignments(s)
+		if num == 50 {
+			return nil
+		}
+		return fmt.Errorf("Consumers is only %d", num)
+	})
+}
+
+// https://github.com/nats-io/nats-server/issues/3636
+func TestJetStreamClusterScaleDownDuringServerOffline(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	for i := 0; i < 100; i++ {
+		sendStreamMsg(t, nc, "foo", "hello")
+	}
+
+	s := c.randomNonStreamLeader(globalAccountName, "TEST")
+	s.Shutdown()
+
+	c.waitOnLeader()
+
+	nc, js = jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err = js.UpdateStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 1,
+	})
+	require_NoError(t, err)
+
+	s = c.restartServer(s)
+	checkFor(t, time.Second, 200*time.Millisecond, func() error {
+		hs := s.healthz(nil)
+		if hs.Error != _EMPTY_ {
+			return errors.New(hs.Error)
+		}
+		return nil
+	})
+}
+
+// Reported by a customer manually upgrading their streams to support direct gets.
+// Worked if single replica but not in clustered mode.
+func TestJetStreamClusterDirectGetStreamUpgrade(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:              "KV_TEST",
+		Subjects:          []string{"$KV.TEST.>"},
+		Discard:           nats.DiscardNew,
+		MaxMsgsPerSubject: 1,
+		DenyDelete:        true,
+		Replicas:          3,
+	})
+	require_NoError(t, err)
+
+	kv, err := js.KeyValue("TEST")
+	require_NoError(t, err)
+
+	_, err = kv.PutString("name", "derek")
+	require_NoError(t, err)
+
+	entry, err := kv.Get("name")
+	require_NoError(t, err)
+	require_True(t, string(entry.Value()) == "derek")
+
+	// Now simulate a update to the stream to support direct gets.
+	_, err = js.UpdateStream(&nats.StreamConfig{
+		Name:              "KV_TEST",
+		Subjects:          []string{"$KV.TEST.>"},
+		Discard:           nats.DiscardNew,
+		MaxMsgsPerSubject: 1,
+		DenyDelete:        true,
+		AllowDirect:       true,
+		Replicas:          3,
+	})
+	require_NoError(t, err)
+
+	// Rebind to KV to make sure we DIRECT version of Get().
+	kv, err = js.KeyValue("TEST")
+	require_NoError(t, err)
+
+	// Make sure direct get works.
+	entry, err = kv.Get("name")
+	require_NoError(t, err)
+	require_True(t, string(entry.Value()) == "derek")
+}
+
+// For interest (or workqueue) based streams its important to match the replication factor.
+// This was the case but now that more control over consumer creation is allowed its possible
+// to create a consumer where the replication factor does not match. This could cause
+// instability in the state between servers and cause problems on leader switches.
+func TestJetStreamClusterInterestPolicyStreamForConsumersToMatchRFactor(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Retention: nats.InterestPolicy,
+		Replicas:  3,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "XX",
+		AckPolicy: nats.AckExplicitPolicy,
+		Replicas:  1,
+	})
+
+	require_Error(t, err, NewJSConsumerReplicasShouldMatchStreamError())
+}
+
+// https://github.com/nats-io/nats-server/issues/3791
+func TestJetStreamClusterKVWatchersWithServerDown(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{
+		Bucket:   "TEST",
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	kv.PutString("foo", "bar")
+	kv.PutString("foo", "baz")
+
+	// Shutdown a follower.
+	s := c.randomNonStreamLeader(globalAccountName, "KV_TEST")
+	s.Shutdown()
+	c.waitOnLeader()
+
+	nc, _ = jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	js, err = nc.JetStream(nats.MaxWait(2 * time.Second))
+	require_NoError(t, err)
+
+	kv, err = js.KeyValue("TEST")
+	require_NoError(t, err)
+
+	for i := 0; i < 100; i++ {
+		w, err := kv.Watch("foo")
+		require_NoError(t, err)
+		w.Stop()
+	}
+}
+
+// TestJetStreamClusterCurrentVsHealth is designed to show the
+// difference between "current" and "healthy" when async publishes
+// outpace the rate at which they can be applied.
+func TestJetStreamClusterCurrentVsHealth(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	c.waitOnLeader()
+	server := c.randomNonLeader()
+
+	nc, js := jsClientConnect(t, server)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	server = c.randomNonStreamLeader(globalAccountName, "TEST")
+	stream, err := server.GlobalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	raft, ok := stream.raftGroup().node.(*raft)
+	require_True(t, ok)
+
+	for i := 0; i < 1000; i++ {
+		_, err := js.PublishAsync("foo", []byte("bar"))
+		require_NoError(t, err)
+
+		raft.RLock()
+		commit := raft.commit
+		applied := raft.applied
+		raft.RUnlock()
+
+		current := raft.Current()
+		healthy := raft.Healthy()
+
+		if !current || !healthy || commit != applied {
+			t.Logf(
+				"%d | Current %v, healthy %v, commit %d, applied %d, pending %d",
+				i, current, healthy, commit, applied, commit-applied,
+			)
+		}
+	}
+}
+
+// Several users and customers use this setup, but many times across leafnodes.
+// This should be allowed in same account since we are really protecting against
+// multiple pub acks with cycle detection.
+func TestJetStreamClusterActiveActiveSourcedStreams(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "A",
+		Subjects: []string{"A.>"},
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "B",
+		Subjects: []string{"B.>"},
+	})
+	require_NoError(t, err)
+
+	_, err = js.UpdateStream(&nats.StreamConfig{
+		Name:     "A",
+		Subjects: []string{"A.>"},
+		Sources: []*nats.StreamSource{{
+			Name:          "B",
+			FilterSubject: "B.>",
+		}},
+	})
+	require_NoError(t, err)
+
+	// Before this would fail.
+	_, err = js.UpdateStream(&nats.StreamConfig{
+		Name:     "B",
+		Subjects: []string{"B.>"},
+		Sources: []*nats.StreamSource{{
+			Name:          "A",
+			FilterSubject: "A.>",
+		}},
+	})
+	require_NoError(t, err)
+}
+
+func TestJetStreamClusterUpdateConsumerShouldNotForceDeleteOnRestart(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R7S", 7)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo", "bar"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	ci, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:        "D",
+		DeliverSubject: "_no_bind_",
+	})
+	require_NoError(t, err)
+
+	// Shutdown a consumer follower.
+	nc.Close()
+	s := c.serverByName(ci.Cluster.Replicas[0].Name)
+	s.Shutdown()
+
+	c.waitOnLeader()
+
+	nc, js = jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Change delivery subject.
+	_, err = js.UpdateConsumer("TEST", &nats.ConsumerConfig{
+		Durable:        "D",
+		DeliverSubject: "_d_",
+	})
+	require_NoError(t, err)
+
+	// Create interest in new and old deliver subject.
+	_, err = nc.SubscribeSync("_d_")
+	require_NoError(t, err)
+	_, err = nc.SubscribeSync("_no_bind_")
+	require_NoError(t, err)
+	nc.Flush()
+
+	c.restartServer(s)
+	c.waitOnAllCurrent()
+
+	// Wait on bad error that would cleanup consumer.
+	time.Sleep(time.Second)
+
+	_, err = js.ConsumerInfo("TEST", "D")
+	require_NoError(t, err)
+}
+
+func TestJetStreamClusterInterestPolicyEphemeral(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	for _, test := range []struct {
+		testName string
+		stream   string
+		subject  string
+		durable  string
+		name     string
+	}{
+		{testName: "InterestWithDurable", durable: "eph", subject: "intdur", stream: "INT_DUR"},
+		{testName: "InterestWithName", name: "eph", subject: "inteph", stream: "INT_EPH"},
+	} {
+		t.Run(test.testName, func(t *testing.T) {
+			var err error
+
+			nc, js := jsClientConnect(t, c.randomServer())
+			defer nc.Close()
+
+			_, err = js.AddStream(&nats.StreamConfig{
+				Name:      test.stream,
+				Subjects:  []string{test.subject},
+				Retention: nats.LimitsPolicy,
+				Replicas:  3,
+			})
+			require_NoError(t, err)
+
+			const inactiveThreshold = time.Second
+
+			_, err = js.AddConsumer(test.stream, &nats.ConsumerConfig{
+				DeliverSubject:    nats.NewInbox(),
+				AckPolicy:         nats.AckExplicitPolicy,
+				InactiveThreshold: inactiveThreshold,
+				Durable:           test.durable,
+				Name:              test.name,
+			})
+			require_NoError(t, err)
+
+			name := test.durable
+			if test.durable == _EMPTY_ {
+				name = test.name
+			}
+
+			const msgs = 5_000
+			done, count := make(chan bool), 0
+
+			sub, err := js.Subscribe(_EMPTY_, func(msg *nats.Msg) {
+				require_NoError(t, msg.Ack())
+				count++
+				if count >= msgs {
+					done <- true
+				}
+			}, nats.Bind(test.stream, name), nats.ManualAck())
+			require_NoError(t, err)
+
+			// This happens only if we start publishing messages after consumer was created.
+			pubDone := make(chan struct{})
+			go func(subject string) {
+				for i := 0; i < msgs; i++ {
+					js.Publish(subject, []byte("DATA"))
+				}
+				close(pubDone)
+			}(test.subject)
+
+			// Wait for inactive threshold to expire and all messages to be published and received
+			// Bug is we clean up active consumers when we should not.
+			time.Sleep(3 * inactiveThreshold / 2)
+
+			select {
+			case <-pubDone:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("Did not receive completion signal")
+			}
+
+			info, err := js.ConsumerInfo(test.stream, name)
+			if err != nil {
+				t.Fatalf("Expected to be able to retrieve consumer: %v", err)
+			}
+			require_True(t, info.Delivered.Stream == msgs)
+
+			// Stop the subscription and remove the interest.
+			err = sub.Unsubscribe()
+			require_NoError(t, err)
+
+			// Now wait for interest inactivity threshold to kick in.
+			time.Sleep(3 * inactiveThreshold / 2)
+
+			// Check if the consumer has been removed.
+			_, err = js.ConsumerInfo(test.stream, name)
+			require_Error(t, err, nats.ErrConsumerNotFound)
+		})
+	}
+}
+
+// TestJetStreamClusterWALBuildupOnNoOpPull tests whether or not the consumer
+// RAFT log is being compacted when the stream is idle but we are performing
+// lots of fetches. Otherwise the disk usage just spirals out of control if
+// there are no other state changes to trigger a compaction.
+func TestJetStreamClusterWALBuildupOnNoOpPull(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	sub, err := js.PullSubscribe(
+		"foo",
+		"durable",
+		nats.ConsumerReplicas(3),
+	)
+	require_NoError(t, err)
+
+	for i := 0; i < 10000; i++ {
+		_, _ = sub.Fetch(1, nats.MaxWait(time.Microsecond))
+	}
+
+	// Needs to be at least 10 seconds, otherwise we won't hit the
+	// minSnapDelta that prevents us from snapshotting too often
+	time.Sleep(time.Second * 11)
+
+	for i := 0; i < 1024; i++ {
+		_, _ = sub.Fetch(1, nats.MaxWait(time.Microsecond))
+	}
+
+	time.Sleep(time.Second)
+
+	server := c.randomNonConsumerLeader(globalAccountName, "TEST", "durable")
+
+	stream, err := server.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	consumer := stream.lookupConsumer("durable")
+	require_NotNil(t, consumer)
+
+	entries, bytes := consumer.raftNode().Size()
+	t.Log("new entries:", entries)
+	t.Log("new bytes:", bytes)
+
+	if max := uint64(1024); entries > max {
+		t.Fatalf("got %d entries, expected less than %d entries", entries, max)
+	}
+}
+
+// Found in https://github.com/nats-io/nats-server/issues/3848
+// When Max Age was specified and stream was scaled up, new replicas
+// were expiring messages much later than the leader.
+func TestJetStreamClusterStreamMaxAgeScaleUp(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	for _, test := range []struct {
+		name    string
+		storage nats.StorageType
+		stream  string
+		purge   bool
+	}{
+		{name: "file", storage: nats.FileStorage, stream: "A", purge: false},
+		{name: "memory", storage: nats.MemoryStorage, stream: "B", purge: false},
+		{name: "file with purge", storage: nats.FileStorage, stream: "C", purge: true},
+		{name: "memory with purge", storage: nats.MemoryStorage, stream: "D", purge: true},
+	} {
+
+		t.Run(test.name, func(t *testing.T) {
+			ttl := time.Second * 5
+			// Add stream with one replica and short MaxAge.
+			_, err := js.AddStream(&nats.StreamConfig{
+				Name:     test.stream,
+				Replicas: 1,
+				Subjects: []string{test.stream},
+				MaxAge:   ttl,
+				Storage:  test.storage,
+			})
+			require_NoError(t, err)
+
+			// Add some messages.
+			for i := 0; i < 10; i++ {
+				sendStreamMsg(t, nc, test.stream, "HELLO")
+			}
+			// We need to also test if we properly set expiry
+			// if first sequence is not 1.
+			if test.purge {
+				err = js.PurgeStream(test.stream)
+				require_NoError(t, err)
+				// Add some messages.
+				for i := 0; i < 10; i++ {
+					sendStreamMsg(t, nc, test.stream, "HELLO")
+				}
+			}
+			// Mark the time when all messages were published.
+			start := time.Now()
+
+			// Sleep for half of the MaxAge time.
+			time.Sleep(ttl / 2)
+
+			// Scale up the Stream to 3 replicas.
+			_, err = js.UpdateStream(&nats.StreamConfig{
+				Name:     test.stream,
+				Replicas: 3,
+				Subjects: []string{test.stream},
+				MaxAge:   ttl,
+				Storage:  test.storage,
+			})
+			require_NoError(t, err)
+
+			// All messages should still be there.
+			info, err := js.StreamInfo(test.stream)
+			require_NoError(t, err)
+			require_True(t, info.State.Msgs == 10)
+
+			// Wait until MaxAge is reached.
+			time.Sleep(ttl - time.Since(start) + (10 * time.Millisecond))
+
+			// Check if all messages are expired.
+			info, err = js.StreamInfo(test.stream)
+			require_NoError(t, err)
+			require_True(t, info.State.Msgs == 0)
+
+			// Now switch leader to one of replicas
+			_, err = nc.Request(fmt.Sprintf(JSApiStreamLeaderStepDownT, test.stream), nil, time.Second)
+			require_NoError(t, err)
+			c.waitOnStreamLeader("$G", test.stream)
+
+			// and make sure that it also expired all messages
+			info, err = js.StreamInfo(test.stream)
+			require_NoError(t, err)
+			require_True(t, info.State.Msgs == 0)
+		})
+	}
 }

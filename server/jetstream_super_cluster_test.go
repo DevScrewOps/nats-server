@@ -444,13 +444,13 @@ func TestJetStreamSuperClusterInterestOnlyMode(t *testing.T) {
 			gateways = [{name: %s, urls: ["nats://127.0.0.1:%d"]}]
 		}
 	`
-	storeDir1 := createDir(t, JetStreamStoreDir)
+	storeDir1 := t.TempDir()
 	conf1 := createConfFile(t, []byte(fmt.Sprintf(template,
 		"S1", storeDir1, "", 23222, "A", 23222, "A", 11222, "B", 11223)))
 	s1, o1 := RunServerWithConfig(conf1)
 	defer s1.Shutdown()
 
-	storeDir2 := createDir(t, JetStreamStoreDir)
+	storeDir2 := t.TempDir()
 	conf2 := createConfFile(t, []byte(fmt.Sprintf(template,
 		"S2", storeDir2, "", 23223, "B", 23223, "B", 11223, "A", 11222)))
 	s2, o2 := RunServerWithConfig(conf2)
@@ -1660,6 +1660,7 @@ func TestJetStreamSuperClusterConsumerDeliverNewBug(t *testing.T) {
 		removeDir(t, sd)
 		s = c.restartServer(s)
 		c.waitOnServerHealthz(s)
+		c.waitOnConsumerLeader("$G", "T", "d")
 	}
 
 	c.waitOnConsumerLeader("$G", "T", "d")
@@ -2081,13 +2082,8 @@ func TestJetStreamSuperClusterMovingStreamAndMoveBack(t *testing.T) {
 
 			toSend := 10_000
 			for i := 0; i < toSend; i++ {
-				_, err := js.PublishAsync("TEST", []byte("HELLO WORLD"))
+				_, err := js.Publish("TEST", []byte("HELLO WORLD"))
 				require_NoError(t, err)
-			}
-			select {
-			case <-js.PublishAsyncComplete():
-			case <-time.After(5 * time.Second):
-				t.Fatalf("Did not receive completion signal")
 			}
 
 			_, err = js.UpdateStream(&nats.StreamConfig{
@@ -2275,7 +2271,6 @@ func TestJetStreamSuperClusterImportConsumerStreamSubjectRemap(t *testing.T) {
 				password: pwd
 			}
 		`, scl.getOpts().LeafNode.Port)))
-			defer removeFile(t, cf)
 			s, _ := RunServerWithConfig(cf)
 			defer s.Shutdown()
 			checkLeafNodeConnected(t, scl)
@@ -2310,7 +2305,6 @@ func TestJetStreamSuperClusterImportConsumerStreamSubjectRemap(t *testing.T) {
 				},
 			}
 		`, scl.getOpts().LeafNode.Port)))
-			defer removeFile(t, cf)
 			s, _ := RunServerWithConfig(cf)
 			defer s.Shutdown()
 			checkLeafNodeConnected(t, scl)

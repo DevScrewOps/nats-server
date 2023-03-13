@@ -142,7 +142,7 @@ type jsAccount struct {
 	store     TemplateStore
 
 	// From server
-	sendq *ipQueue // of *pubMsg
+	sendq *ipQueue[*pubMsg]
 
 	// Usage/limits related fields that will be protected by usageMu
 	usageMu    sync.RWMutex
@@ -784,9 +784,9 @@ func (js *jetStream) setJetStreamStandAlone(isStandAlone bool) {
 // JetStreamEnabled reports if jetstream is enabled for this server.
 func (s *Server) JetStreamEnabled() bool {
 	var js *jetStream
-	s.mu.Lock()
+	s.mu.RLock()
 	js = s.js
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	return js.isEnabled()
 }
 
@@ -853,9 +853,9 @@ func (s *Server) signalPullConsumers() {
 
 // Shutdown jetstream for this server.
 func (s *Server) shutdownJetStream() {
-	s.mu.Lock()
+	s.mu.RLock()
 	js := s.js
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	if js == nil {
 		return
@@ -1142,6 +1142,10 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 	}
 	var consumers []*ce
 
+	// Collect any interest policy streams to check for
+	// https://github.com/nats-io/nats-server/issues/3612
+	var ipstreams []*stream
+
 	// Remember if we should be encrypted and what cipher we think we should use.
 	encrypted := s.getOpts().JetStreamKey != _EMPTY_
 	plaintext := true
@@ -1284,6 +1288,12 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 		state := mset.state()
 		s.Noticef("  Restored %s messages for stream '%s > %s'", comma(int64(state.Msgs)), mset.accName(), mset.name())
 
+		// Collect to check for dangling messages.
+		// TODO(dlc) - Can be removed eventually.
+		if cfg.StreamConfig.Retention == InterestPolicy {
+			ipstreams = append(ipstreams, mset)
+		}
+
 		// Now do the consumers.
 		odir := filepath.Join(sdir, fi.Name(), consumerDir)
 		consumers = append(consumers, &ce{mset, odir})
@@ -1367,6 +1377,12 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 
 	// Make sure to cleanup any old remaining snapshots.
 	os.RemoveAll(filepath.Join(jsa.storeDir, snapsDir))
+
+	// Check interest policy streams for auto cleanup.
+	for _, mset := range ipstreams {
+		mset.checkForOrphanMsgs()
+		mset.checkConsumerReplication()
+	}
 
 	s.Debugf("JetStream state for account %q recovered", a.Name)
 

@@ -199,10 +199,10 @@ func TestJetStreamClusterMultiRestartBug(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	checkFor(t, 10*time.Second, 250*time.Millisecond, func() error {
+	checkFor(t, 20*time.Second, 250*time.Millisecond, func() error {
 		si, _ := js2.StreamInfo("TEST")
 		if si == nil || si.Cluster == nil {
-			t.Fatalf("Did not get stream info")
+			return fmt.Errorf("No stream info or cluster")
 		}
 		for _, pi := range si.Cluster.Replicas {
 			if !pi.Current {
@@ -2034,16 +2034,15 @@ func TestJetStreamClusterMaxConsumersMultipleConcurrentRequests(t *testing.T) {
 
 	startCh := make(chan bool)
 	var wg sync.WaitGroup
-
+	wg.Add(10)
 	for n := 0; n < 10; n++ {
-		wg.Add(1)
-		go func() {
+		nc, js := jsClientConnect(t, c.randomServer())
+		defer nc.Close()
+		go func(js nats.JetStreamContext) {
 			defer wg.Done()
-			nc, js := jsClientConnect(t, c.randomServer())
-			defer nc.Close()
 			<-startCh
 			js.SubscribeSync("in.maxcc.foo")
-		}()
+		}(js)
 	}
 	// Wait for Go routines.
 	time.Sleep(250 * time.Millisecond)
@@ -2052,6 +2051,97 @@ func TestJetStreamClusterMaxConsumersMultipleConcurrentRequests(t *testing.T) {
 	wg.Wait()
 
 	var names []string
+	for n := range js.ConsumerNames("MAXCC") {
+		names = append(names, n)
+	}
+	if nc := len(names); nc > 1 {
+		t.Fatalf("Expected only 1 consumer, got %d", nc)
+	}
+}
+
+func TestJetStreamClusterAccountMaxStreamsAndConsumersMultipleConcurrentRequests(t *testing.T) {
+	tmpl := `
+	listen: 127.0.0.1:-1
+	server_name: %s
+	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+
+	leaf {
+		listen: 127.0.0.1:-1
+	}
+
+	cluster {
+		name: %s
+		listen: 127.0.0.1:%d
+		routes = [%s]
+	}
+
+	accounts {
+		A {
+			jetstream {
+				max_file: 9663676416
+				max_streams: 2
+				max_consumers: 1
+			}
+			users = [ { user: "a", pass: "pwd" } ]
+		}
+		$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+	}
+	`
+	c := createJetStreamClusterWithTemplate(t, tmpl, "JSC", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer(), nats.UserInfo("a", "pwd"))
+	defer nc.Close()
+
+	cfg := &nats.StreamConfig{
+		Name:     "MAXCC",
+		Storage:  nats.MemoryStorage,
+		Subjects: []string{"in.maxcc.>"},
+		Replicas: 3,
+	}
+	if _, err := js.AddStream(cfg); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	si, err := js.StreamInfo("MAXCC")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if si.Config.MaxConsumers != -1 {
+		t.Fatalf("Expected max of -1, got %d", si.Config.MaxConsumers)
+	}
+
+	startCh := make(chan bool)
+	var wg sync.WaitGroup
+	wg.Add(10)
+	for n := 0; n < 10; n++ {
+		nc, js := jsClientConnect(t, c.randomServer(), nats.UserInfo("a", "pwd"))
+		defer nc.Close()
+		go func(js nats.JetStreamContext, idx int) {
+			defer wg.Done()
+			<-startCh
+			// Test adding new streams
+			js.AddStream(&nats.StreamConfig{
+				Name:     fmt.Sprintf("OTHER_%d", idx),
+				Replicas: 3,
+			})
+			// Test adding consumers to MAXCC stream
+			js.SubscribeSync("in.maxcc.foo", nats.BindStream("MAXCC"))
+		}(js, n)
+	}
+	// Wait for Go routines.
+	time.Sleep(250 * time.Millisecond)
+
+	close(startCh)
+	wg.Wait()
+
+	var names []string
+	for n := range js.StreamNames() {
+		names = append(names, n)
+	}
+	if nc := len(names); nc > 2 {
+		t.Fatalf("Expected only 2 streams, got %d", nc)
+	}
+	names = names[:0]
 	for n := range js.ConsumerNames("MAXCC") {
 		names = append(names, n)
 	}
@@ -2539,7 +2629,8 @@ func TestJetStreamClusterStreamCatchupNoState(t *testing.T) {
 				t.Fatalf("Error installing snapshot: %v", err)
 			}
 		}
-		js.Publish("foo.created", []byte("REQ"))
+		_, err := js.Publish("foo.created", []byte("REQ"))
+		require_NoError(t, err)
 	}
 
 	config := nsl.JetStreamConfig()
@@ -2578,14 +2669,14 @@ func TestJetStreamClusterStreamCatchupNoState(t *testing.T) {
 	nc, js = jsClientConnect(t, c.randomServer())
 	defer nc.Close()
 
-	if _, err := js.Publish("foo.created", []byte("REQ")); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
+	c.waitOnStreamLeader("$G", "TEST")
+
+	_, err = js.Publish("foo.created", []byte("ZZZ"))
+	require_NoError(t, err)
 
 	si, err := js.StreamInfo("TEST")
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
+	require_NoError(t, err)
+
 	if si.State.LastSeq != 101 {
 		t.Fatalf("bad state after restart: %+v", si.State)
 	}
@@ -2686,7 +2777,7 @@ func TestJetStreamClusterMixedModeColdStartPrune(t *testing.T) {
 }
 
 func TestJetStreamClusterMirrorAndSourceCrossNonNeighboringDomain(t *testing.T) {
-	storeDir1 := createDir(t, JetStreamStoreDir)
+	storeDir1 := t.TempDir()
 	conf1 := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:-1
 		jetstream: {max_mem_store: 256MB, max_file_store: 256MB, domain: domain1, store_dir: '%s'}
@@ -2702,7 +2793,7 @@ func TestJetStreamClusterMirrorAndSourceCrossNonNeighboringDomain(t *testing.T) 
 	`, storeDir1)))
 	s1, _ := RunServerWithConfig(conf1)
 	defer s1.Shutdown()
-	storeDir2 := createDir(t, JetStreamStoreDir)
+	storeDir2 := t.TempDir()
 	conf2 := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:-1
 		jetstream: {max_mem_store: 256MB, max_file_store: 256MB, domain: domain2, store_dir: '%s'}
@@ -2719,7 +2810,7 @@ func TestJetStreamClusterMirrorAndSourceCrossNonNeighboringDomain(t *testing.T) 
 	`, storeDir2, s1.opts.LeafNode.Port, s1.opts.LeafNode.Port)))
 	s2, _ := RunServerWithConfig(conf2)
 	defer s2.Shutdown()
-	storeDir3 := createDir(t, JetStreamStoreDir)
+	storeDir3 := t.TempDir()
 	conf3 := createConfFile(t, []byte(fmt.Sprintf(`
 		listen: 127.0.0.1:-1
 		jetstream: {max_mem_store: 256MB, max_file_store: 256MB, domain: domain3, store_dir: '%s'}
@@ -2799,10 +2890,7 @@ func TestJetStreamClusterMirrorAndSourceCrossNonNeighboringDomain(t *testing.T) 
 }
 
 func TestJetStreamClusterSeal(t *testing.T) {
-	s := RunBasicJetStreamServer()
-	if config := s.JetStreamConfig(); config != nil {
-		defer removeDir(t, config.StoreDir)
-	}
+	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "JSC", 3)
@@ -3314,10 +3402,7 @@ func TestJetStreamClusterAccountInfoForSystemAccount(t *testing.T) {
 }
 
 func TestJetStreamClusterListFilter(t *testing.T) {
-	s := RunBasicJetStreamServer()
-	if config := s.JetStreamConfig(); config != nil {
-		defer removeDir(t, config.StoreDir)
-	}
+	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
@@ -3370,10 +3455,7 @@ func TestJetStreamClusterListFilter(t *testing.T) {
 }
 
 func TestJetStreamClusterConsumerUpdates(t *testing.T) {
-	s := RunBasicJetStreamServer()
-	if config := s.JetStreamConfig(); config != nil {
-		defer removeDir(t, config.StoreDir)
-	}
+	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "JSC", 5)
@@ -3419,12 +3501,8 @@ func TestJetStreamClusterConsumerUpdates(t *testing.T) {
 		defer sub.Unsubscribe()
 
 		ncfg := *cfg
+		// Deliver Subject
 		ncfg.DeliverSubject = "d.baz"
-
-		// Should fail.
-		_, err = js.AddConsumer("TEST", &ncfg)
-		require_Error(t, err)
-
 		// Description
 		cfg.Description = "New Description"
 		_, err = js.UpdateConsumer("TEST", cfg)
@@ -4138,10 +4216,7 @@ func TestJetStreamClusterRedeliverBackoffs(t *testing.T) {
 }
 
 func TestJetStreamClusterConsumerUpgrade(t *testing.T) {
-	s := RunBasicJetStreamServer()
-	if config := s.JetStreamConfig(); config != nil {
-		defer removeDir(t, config.StoreDir)
-	}
+	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "JSC", 3)
@@ -4157,9 +4232,6 @@ func TestJetStreamClusterConsumerUpgrade(t *testing.T) {
 		// First create a consumer that is push based.
 		_, err = js.AddConsumer("X", &nats.ConsumerConfig{Durable: "dlc", DeliverSubject: "Y"})
 		require_NoError(t, err)
-		// Now do same name but pull. This should be an error.
-		_, err = js.AddConsumer("X", &nats.ConsumerConfig{Durable: "dlc"})
-		require_Error(t, err)
 	}
 
 	t.Run("Single", func(t *testing.T) { testUpdate(t, s) })
@@ -4167,10 +4239,7 @@ func TestJetStreamClusterConsumerUpgrade(t *testing.T) {
 }
 
 func TestJetStreamClusterAddConsumerWithInfo(t *testing.T) {
-	s := RunBasicJetStreamServer()
-	if config := s.JetStreamConfig(); config != nil {
-		defer removeDir(t, config.StoreDir)
-	}
+	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "JSC", 3)
@@ -4624,10 +4693,7 @@ func TestJetStreamClusterMirrorOrSourceNotActiveReporting(t *testing.T) {
 }
 
 func TestJetStreamClusterStreamAdvisories(t *testing.T) {
-	s := RunBasicJetStreamServer()
-	if config := s.JetStreamConfig(); config != nil {
-		defer removeDir(t, config.StoreDir)
-	}
+	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "JSC", 3)
@@ -4808,7 +4874,7 @@ func TestJetStreamClusterDuplicateRoutesDisruptJetStreamMetaGroup(t *testing.T) 
 
 	rports := []int{22208, 22209, 22210}
 	for i, p := range rports {
-		sname, sd := fmt.Sprintf("S%d", i+1), createDir(t, JetStreamStoreDir)
+		sname, sd := fmt.Sprintf("S%d", i+1), t.TempDir()
 		cf := fmt.Sprintf(tmpl, sname, sd, p, rports[0], rports[1], rports[2], rports[0], rports[1], rports[2])
 		s, o := RunServerWithConfig(createConfFile(t, []byte(cf)))
 		c.servers, c.opts = append(c.servers, s), append(c.opts, o)
@@ -5242,10 +5308,7 @@ func TestJetStreamClusterMirrorSourceLoop(t *testing.T) {
 	}
 
 	t.Run("Single", func(t *testing.T) {
-		s := RunBasicJetStreamServer()
-		if config := s.JetStreamConfig(); config != nil {
-			defer removeDir(t, config.StoreDir)
-		}
+		s := RunBasicJetStreamServer(t)
 		defer s.Shutdown()
 		test(t, s, 1)
 	})
@@ -5996,6 +6059,34 @@ func TestJetStreamClusterLeafNodeSPOFMigrateLeaders(t *testing.T) {
 		_, err = nc.Request(dsubj, nil, 500*time.Millisecond)
 		return err
 	})
+
+	nc, _ = jsClientConnect(t, lnc.randomServer())
+	defer nc.Close()
+
+	// Now make sure the consumer, or any other asset, can not become a leader on this node while the leafnode
+	// is disconnected.
+	csd := fmt.Sprintf(JSApiConsumerLeaderStepDownT, "TEST", "d")
+	for i := 0; i < 10; i++ {
+		nc.Request(csd, nil, time.Second)
+		lnc.waitOnConsumerLeader(globalAccountName, "TEST", "d")
+		if lnc.consumerLeader(globalAccountName, "TEST", "d") == cl {
+			t.Fatalf("Consumer leader should not migrate to server without a leafnode connection")
+		}
+	}
+
+	// Now make sure once leafnode is back we can have leaders on this server.
+	cl.reEnableLeafnodes()
+	checkLeafNodeConnectedCount(t, cl, 2)
+
+	// Make sure we can migrate back to this server now that we are connected.
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		nc.Request(csd, nil, time.Second)
+		lnc.waitOnConsumerLeader(globalAccountName, "TEST", "d")
+		if lnc.consumerLeader(globalAccountName, "TEST", "d") == cl {
+			return nil
+		}
+		return fmt.Errorf("Not this server yet")
+	})
 }
 
 func TestJetStreamClusterStreamCatchupWithTruncateAndPriorSnapshot(t *testing.T) {
@@ -6321,10 +6412,7 @@ func TestJetStreamClusterRePublishUpdateNotSupported(t *testing.T) {
 		expectFailUpdate()
 	}
 
-	s := RunBasicJetStreamServer()
-	if config := s.JetStreamConfig(); config != nil {
-		defer removeDir(t, config.StoreDir)
-	}
+	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
 	c := createJetStreamClusterExplicit(t, "JSC", 3)
@@ -6504,9 +6592,12 @@ func TestJetStreamClusterSnapshotBeforePurgeAndCatchup(t *testing.T) {
 	mset, err = nl.GlobalAccount().lookupStream("TEST")
 	require_NoError(t, err)
 
-	if state := mset.state(); state.FirstSeq != 2001 || state.LastSeq != 3000 {
-		t.Fatalf("Incorrect state: %+v", state)
-	}
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		if state := mset.state(); state.FirstSeq != 2001 || state.LastSeq != 3000 {
+			return fmt.Errorf("Incorrect state: %+v", state)
+		}
+		return nil
+	})
 
 	// Make sure we only sent 1 sync catchup msg.
 	nmsgs, _, _ := sub.Pending()

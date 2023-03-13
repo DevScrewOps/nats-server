@@ -41,7 +41,6 @@ func TestJetStreamClusterConfig(t *testing.T) {
 		jetstream: {max_mem_store: 16GB, max_file_store: 10TB, store_dir: '%s'}
 		cluster { listen: 127.0.0.1:-1 }
 	`))
-	defer removeFile(t, conf)
 
 	check := func(errStr string) {
 		t.Helper()
@@ -62,7 +61,6 @@ func TestJetStreamClusterConfig(t *testing.T) {
 		jetstream: {max_mem_store: 16GB, max_file_store: 10TB, store_dir: '%s'}
 		cluster { listen: 127.0.0.1:-1 }
 	`))
-	defer removeFile(t, conf)
 
 	check("requires `cluster.name`")
 }
@@ -1608,7 +1606,6 @@ func TestJetStreamClusterStreamSnapshotCatchup(t *testing.T) {
 	sendBatch(2)
 
 	sl := c.streamLeader("$G", "TEST")
-
 	sl.Shutdown()
 	c.waitOnStreamLeader("$G", "TEST")
 
@@ -1647,9 +1644,12 @@ func TestJetStreamClusterStreamSnapshotCatchup(t *testing.T) {
 	mset, err = sl.GlobalAccount().lookupStream("TEST")
 	require_NoError(t, err)
 
-	if nstate := mset.stateWithDetail(true); !reflect.DeepEqual(ostate, nstate) {
-		t.Fatalf("States do not match after recovery: %+v vs %+v", ostate, nstate)
-	}
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		if nstate := mset.stateWithDetail(true); !reflect.DeepEqual(ostate, nstate) {
+			return fmt.Errorf("States do not match after recovery: %+v vs %+v", ostate, nstate)
+		}
+		return nil
+	})
 }
 
 func TestJetStreamClusterDeleteMsg(t *testing.T) {
@@ -3691,14 +3691,12 @@ func TestJetStreamClusterAccountPurge(t *testing.T) {
 	sysKp, syspub := createKey(t)
 	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
 	sysCreds := newUser(t, sysKp)
-	defer removeFile(t, sysCreds)
 	accKp, accpub := createKey(t)
 	accClaim := jwt.NewAccountClaims(accpub)
 	accClaim.Limits.JetStreamLimits.DiskStorage = 1024 * 1024 * 5
 	accClaim.Limits.JetStreamLimits.MemoryStorage = 1024 * 1024 * 5
 	accJwt := encodeClaim(t, accClaim, accpub)
 	accCreds := newUser(t, accKp)
-	defer removeFile(t, accCreds)
 
 	tmlp := `
 		listen: 127.0.0.1:-1
